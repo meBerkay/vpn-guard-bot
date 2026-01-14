@@ -32,7 +32,7 @@ REPLY_CHECK_PASS = os.getenv('REPLY_CHECK_PASS', EMAIL_PASS)
 # Logic Settings
 POLL_INTERVAL = int(os.getenv('POLL_INTERVAL', 60))
 WAIT_TIME_SECONDS = int(os.getenv('WAIT_TIME_SECONDS', 120))
-TARGET_SUBJECT = os.getenv('TARGET_SUBJECT', 'MESAI SAATI DISI VPN ERISIMI')
+TARGET_SUBJECT = os.getenv('TARGET_SUBJECT', 'VPN access detected')
 
 # Firewall Settings (FortiGate)
 FG_IP = os.getenv('FG_IP')
