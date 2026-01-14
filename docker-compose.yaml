@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  vpn-guard:
+    build: ./app
+    container_name: vpn_guard_bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+    networks:
+      - secops_net
+
+networks:
+  secops_net:
+    driver: bridge
