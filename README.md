@@ -19,5 +19,5 @@ Bu projeyi Docker kullanarak dakikalar içinde ayağa kaldırabilirsiniz.
 
 ### 1. Projeyi Klonlayın
 ```bash
-git clone [https://github.com/merberkay/vpn-guard-bot.git](https://github.com/meberkay/vpn-guard-bot.git)
+git clone https://github.com/meberkay/vpn-guard-bot.git
 cd vpn-guard-bot
