@@ -1,297 +1,316 @@
+import os
+import time
+import ssl
+import re
+import logging
+import threading
 import imaplib
 import smtplib
-import email
 from email.header import decode_header
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-import re
-import os
-import time
-import datetime
-import ssl
-import threading
+from datetime import datetime
 from netmiko import ConnectHandler
 
-# --- CONFIGURATION (LOAD FROM ENV) ---
-IMAP_SERVER = os.getenv('IMAP_SERVER')
-IMAP_PORT = int(os.getenv('IMAP_PORT', 993))
-SMTP_SERVER = os.getenv('SMTP_SERVER')
-SMTP_PORT = int(os.getenv('SMTP_PORT', 587))
-EMAIL_USER = os.getenv('EMAIL_USER') 
-EMAIL_PASS = os.getenv('EMAIL_PASS')
+# --- LOGGING SETUP ---
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger("VPNSentinel")
 
-# Mail Settings
-SENDER_ADDR = os.getenv('SENDER_ADDR', EMAIL_USER)
-REPLY_TO_ADDR = os.getenv('REPLY_TO_ADDR', EMAIL_USER)
-COMPANY_DOMAIN = os.getenv('COMPANY_DOMAIN', '@example.com') # Örn: @sirket.com
-
-# Reply Verification Account (Usually same as EMAIL_USER)
-REPLY_CHECK_USER = os.getenv('REPLY_CHECK_USER', EMAIL_USER)
-REPLY_CHECK_PASS = os.getenv('REPLY_CHECK_PASS', EMAIL_PASS)
-
-# Logic Settings
-POLL_INTERVAL = int(os.getenv('POLL_INTERVAL', 60))
-WAIT_TIME_SECONDS = int(os.getenv('WAIT_TIME_SECONDS', 120))
-TARGET_SUBJECT = os.getenv('TARGET_SUBJECT', 'VPN access detected')
-
-# Firewall Settings (FortiGate)
-FG_IP = os.getenv('FG_IP')
-FG_USER = os.getenv('FG_USER')
-FG_PASS = os.getenv('FG_PASS')
-FG_SSH_PORT = int(os.getenv('FG_SSH_PORT', 22))
-
-# --- HELPER FUNCTIONS ---
-
-def create_unverified_context():
-    context = ssl.create_default_context()
-    context.check_hostname = False
-    context.verify_mode = ssl.CERT_NONE
-    return context
-
-def get_imap_connection(user, password):
-    ssl_context = create_unverified_context()
-    mail = imaplib.IMAP4_SSL(IMAP_SERVER, IMAP_PORT, ssl_context=ssl_context)
-    mail.login(user, password)
-    return mail
-
-def get_decoded_header(header_value):
-    if not header_value: return ""
-    decoded_list = decode_header(header_value)
-    full_subject = ""
-    for content, encoding in decoded_list:
-        if isinstance(content, bytes):
-            full_subject += content.decode(encoding if encoding else 'utf-8', errors='ignore')
-        else:
-            full_subject += content
-    return full_subject
-
-# --- ACTIVE RESPONSE (FIREWALL BLOCK) ---
-
-def kill_vpn_session_ssh(username):
-    """Connects to FortiGate via SSH and terminates the VPN session."""
-    if not FG_IP or not FG_USER:
-        print("[WARN] Firewall configuration missing. Skipping kill action.")
-        return
-
-    print(f"[ACTION] Terminating VPN session for {username} via SSH...")
+# --- CONFIGURATION CLASS ---
+class Config:
+    """Loads and validates environment variables."""
+    # Email Server
+    IMAP_HOST = os.getenv('IMAP_SERVER')
+    IMAP_PORT = int(os.getenv('IMAP_PORT', 993))
+    SMTP_HOST = os.getenv('SMTP_SERVER')
+    SMTP_PORT = int(os.getenv('SMTP_PORT', 587))
     
-    fg_device = {
-        'device_type': 'fortinet',
-        'host': FG_IP,
-        'username': FG_USER,
-        'password': FG_PASS,
-        'port': FG_SSH_PORT,
-        'global_delay_factor': 2
-    }
-
-    try:
-        net_connect = ConnectHandler(**fg_device)
-        # Command syntax for FortiOS
-        command = f"execute vpn ssl disconnect user {username}"
-        output = net_connect.send_command(command)
-        print(f"[FIREWALL] Output: {output}")
-        net_connect.disconnect()
-        print(f"[SUCCESS] User {username} kicked from VPN.")
-    except Exception as e:
-        print(f"[ERROR] Firewall SSH Connection Error: {e}")
-
-# --- VERIFICATION THREAD ---
-
-def verify_response_and_act(target_user, target_ip):
-    """Waits for X seconds, checks for a reply, and kills session if no reply found."""
+    # Credentials
+    AUTH_EMAIL = os.getenv('EMAIL_USER')
+    AUTH_PASS = os.getenv('EMAIL_PASS')
     
-    print(f"[TIMER] Countdown started for {target_user} ({WAIT_TIME_SECONDS}s)...")
-    time.sleep(WAIT_TIME_SECONDS)
+    # Sender Info
+    SENDER_EMAIL = os.getenv('SENDER_ADDR', AUTH_EMAIL)
+    REPLY_TO = os.getenv('REPLY_TO_ADDR', AUTH_EMAIL)
+    ORG_DOMAIN = os.getenv('COMPANY_DOMAIN', '@example.com')
+
+    # Logic
+    CHECK_INTERVAL = int(os.getenv('POLL_INTERVAL', 60))
+    GRACE_PERIOD = int(os.getenv('WAIT_TIME_SECONDS', 120))
+    TRIGGER_SUBJECT = os.getenv('TARGET_SUBJECT', 'VPN Access Detected').upper()
+
+    # Firewall (FortiOS)
+    FW_HOST = os.getenv('FG_IP')
+    FW_USER = os.getenv('FG_USER')
+    FW_PASS = os.getenv('FG_PASS')
+    FW_PORT = int(os.getenv('FG_SSH_PORT', 22))
+
+# --- FIREWALL MANAGER ---
+class FirewallManager:
+    """Handles SSH connections and command execution on the Firewall."""
     
-    print(f"[TIMER] Time is up for {target_user}. Checking replies...")
-    
-    try:
-        mail = get_imap_connection(REPLY_CHECK_USER, REPLY_CHECK_PASS)
-        mail.select("inbox")
+    def __init__(self):
+        self.device_config = {
+            'device_type': 'fortinet',
+            'host': Config.FW_HOST,
+            'username': Config.FW_USER,
+            'password': Config.FW_PASS,
+            'port': Config.FW_PORT,
+            'global_delay_factor': 2
+        }
+
+    def terminate_session(self, username: str) -> bool:
+        """Kicks the user off the VPN."""
+        if not Config.FW_HOST:
+            logger.warning("Firewall IP not configured. Skipping active response.")
+            return False
+
+        logger.info(f"Initiating active response against user: {username}")
         
-        # Search for mails FROM the user
-        user_email = f"{target_user}{COMPANY_DOMAIN}"
-        search_criteria = f'(FROM "{user_email}")'
+        try:
+            with ConnectHandler(**self.device_config) as ssh:
+                # FortiOS command to kill SSL VPN user
+                cmd = f"execute vpn ssl disconnect user {username}"
+                output = ssh.send_command(cmd)
+                logger.info(f"Firewall Output: {output}")
+                return True
+        except Exception as e:
+            logger.error(f"Failed to execute firewall command: {e}")
+            return False
+
+# --- EMAIL SERVICE ---
+class EmailService:
+    """Handles IMAP reading and SMTP sending."""
+
+    def _get_ssl_context(self):
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        return ctx
+
+    def connect_imap(self):
+        client = imaplib.IMAP4_SSL(
+            Config.IMAP_HOST, 
+            Config.IMAP_PORT, 
+            ssl_context=self._get_ssl_context()
+        )
+        client.login(Config.AUTH_EMAIL, Config.AUTH_PASS)
+        return client
+
+    def decode_subject(self, header_val):
+        if not header_val: return ""
+        decoded_list = decode_header(header_val)
+        result = ""
+        for content, encoding in decoded_list:
+            if isinstance(content, bytes):
+                result += content.decode(encoding if encoding else 'utf-8', errors='ignore')
+            else:
+                result += content
+        return result
+
+    def send_verification_request(self, username: str, timestamp: str, src_ip: str) -> bool:
+        """Sends the challenge email to the user."""
+        recipient = f"{username}{Config.ORG_DOMAIN}"
+        subject = f"SECURITY ACTION REQUIRED: VPN Verification ({username})"
         
-        # Note: Ideally, we should check the time of the email too.
-        # This simple check looks for ANY unread email from the user in the inbox.
-        status, messages = mail.search(None, search_criteria)
+        body = f"""
+        Hello {username},
+
+        A VPN connection was established using your credentials.
         
-        has_replied = False
-        if messages[0]:
-            has_replied = True
-            print(f"[VERIFIED] Reply received from {target_user}. No action needed.")
+        Time: {timestamp}
+        Source IP: {src_ip}
         
-        mail.close()
-        mail.logout()
+        SYSTEM ACTION:
+        If you do not REPLY to this email within {int(Config.GRACE_PERIOD/60)} minutes, 
+        your session will be forcefully terminated.
         
-        if not has_replied:
-            print(f"[ALERT] NO REPLY from {target_user} (IP: {target_ip})! Initiating Active Response...")
-            kill_vpn_session_ssh(target_user)
+        If this wasn't you, contact Security Operations immediately.
+        """
+
+        msg = MIMEMultipart()
+        msg['From'] = Config.SENDER_EMAIL
+        msg['To'] = recipient
+        msg['Subject'] = subject
+        msg['Reply-To'] = Config.REPLY_TO
+        msg.attach(MIMEText(body, 'plain'))
+
+        try:
+            with smtplib.SMTP(Config.SMTP_HOST, Config.SMTP_PORT) as server:
+                try:
+                    server.starttls(context=self._get_ssl_context())
+                    server.login(Config.AUTH_EMAIL, Config.AUTH_PASS)
+                except Exception as auth_err:
+                    logger.debug(f"SMTP Auth skipped or failed: {auth_err}")
+                
+                server.sendmail(Config.SENDER_EMAIL, recipient, msg.as_string())
+                logger.info(f"Verification email sent to {recipient}")
+                return True
+        except Exception as e:
+            logger.error(f"Failed to send email: {e}")
+            return False
+
+    def check_for_reply(self, username: str) -> bool:
+        """Searches Inbox for any recent email from the user."""
+        try:
+            client = self.connect_imap()
+            client.select("inbox")
             
-    except Exception as e:
-        print(f"[ERROR] Error verifying response: {e}")
+            user_email = f"{username}{Config.ORG_DOMAIN}"
+            # Search logic: Emails FROM the user
+            status, messages = client.search(None, f'(FROM "{user_email}")')
+            
+            has_reply = False
+            if status == 'OK' and messages[0]:
+                has_reply = True
+            
+            client.close()
+            client.logout()
+            return has_reply
+        except Exception as e:
+            logger.error(f"Error checking replies: {e}")
+            return False
 
-# --- EMAIL LOGIC ---
-
-def send_inquiry_email(target_user, event_time, remote_ip):
-    target_email = f"{target_user}{COMPANY_DOMAIN}"
-    subject = f"SECURITY ALERT: VPN Access Detected ({target_user})"
-    
-    body = f"""
-    Hello {target_user.split('.')[0].capitalize()},
-
-    [AUTOMATED SECURITY CHECK]
-    
-    A VPN session was detected with your account at {event_time}.
-    Source IP: {remote_ip}
-    
-    Since this access is outside of standard business hours (or flagged by SIEM), verification is required.
-
-    ACTION REQUIRED:
-    If this is you, please REPLY to this email within {int(WAIT_TIME_SECONDS/60)} MINUTES with a brief explanation (e.g., "Approved").
-    
-    If we do not receive a reply, your VPN session will be TERMINATED automatically.
-    
-    If this was not you, please contact the Security Team immediately.
-
-    SecOps Automation
-    """
-
-    msg = MIMEMultipart()
-    msg['From'] = SENDER_ADDR
-    msg['To'] = target_email
-    msg['Subject'] = subject
-    msg['Reply-To'] = REPLY_TO_ADDR 
-    msg.attach(MIMEText(body, 'plain'))
-
-    try:
-        server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
-        try:
-            ssl_context = create_unverified_context()
-            server.starttls(context=ssl_context)
-        except: pass
-
-        try:
-            server.login(EMAIL_USER, EMAIL_PASS)
-        except: 
-            print("[INFO] SMTP Auth not supported/needed. Trying anonymous...")
-
-        server.sendmail(SENDER_ADDR, target_email, msg.as_string())
-        server.quit()
-        print(f"[SUCCESS] Warning email sent to {target_email}")
-        return True
-    except Exception as e:
-        print(f"[ERROR] Failed to send email: {e}")
-        return False
-
-def delete_logs_from_trash(mail):
-    """Tries to find and delete logs from 'Deleted Items' or 'Trash'."""
-    try:
-        trash_folders = ["Deleted Items", "Silinmiş Öğeler", "Trash", "Bin"]
-        selected_folder = None
+    def cleanup_mailbox(self, client, deleted_ids):
+        """Expunges deleted emails from Inbox and cleans Trash folder."""
+        if not deleted_ids: return
+        
+        # Expunge Inbox
+        client.expunge()
+        
+        # Clean Trash
+        trash_folders = ["Deleted Items", "Trash", "Bin", "Silinmiş Öğeler"]
         for folder in trash_folders:
             try:
-                if mail.select(folder)[0] == 'OK':
-                    selected_folder = folder
+                status, _ = client.select(folder)
+                if status == 'OK':
+                    # Search for our bot's emails in trash
+                    stat, msgs = client.search(None, f'(SUBJECT "{Config.TRIGGER_SUBJECT}")')
+                    if msgs[0]:
+                        for num in msgs[0].split():
+                            client.store(num, '+FLAGS', '\\Deleted')
+                        client.expunge()
                     break
-            except: continue
+            except:
+                continue
+
+# --- MAIN SENTINEL LOGIC ---
+class VPNSentinel:
+    """Main Orchestrator."""
+    
+    def __init__(self):
+        self.email_svc = EmailService()
+        self.fw_manager = FirewallManager()
+
+    def parse_log_content(self, raw_body: str):
+        """Extracts User, IP, and Time using Regex."""
+        # Generic patterns to catch common log formats
+        user_pattern = re.search(r'user=["\']?([^"\s\']+)["\']?', raw_body, re.IGNORECASE)
+        ip_pattern = re.search(r'remip=([\d\.]+)', raw_body)
+        time_pattern = re.search(r'date=(\S+)\s+time=(\S+)', raw_body)
+
+        return {
+            "user": user_pattern.group(1).replace("&quot;", "").strip() if user_pattern else None,
+            "ip": ip_pattern.group(1) if ip_pattern else "0.0.0.0",
+            "time": f"{time_pattern.group(1)} {time_pattern.group(2)}" if time_pattern else datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+
+    def verification_task(self, username: str, ip: str):
+        """Threaded task: Waits -> Checks Reply -> Kills Session."""
+        logger.info(f"Timer started for {username}. Waiting {Config.GRACE_PERIOD}s...")
+        time.sleep(Config.GRACE_PERIOD)
         
-        if not selected_folder: return
+        logger.info(f"Time's up for {username}. Verifying response...")
+        
+        if self.email_svc.check_for_reply(username):
+            logger.info(f"User {username} verified successfully. No action taken.")
+        else:
+            logger.warning(f"NO REPLY from {username}! Terminating session...")
+            self.fw_manager.terminate_session(username)
 
-        status, messages = mail.search(None, 'ALL')
-        if not messages[0]: return
+    def scan_cycle(self):
+        """One complete scan of the inbox."""
+        try:
+            client = self.email_svc.connect_imap()
+            client.select("inbox")
+            
+            # Fetch unread emails
+            status, messages = client.search(None, 'UNSEEN')
+            if not messages[0]:
+                client.close()
+                client.logout()
+                return
 
-        email_ids = messages[0].split()
-        count = 0
-        for e_id in email_ids:
-            res, msg_data = mail.fetch(e_id, '(RFC822.HEADER)')
-            for part in msg_data:
-                if isinstance(part, tuple):
-                    msg = email.message_from_bytes(part[1])
-                    sub = get_decoded_header(msg.get("Subject"))
-                    if TARGET_SUBJECT in sub.upper():
-                        mail.store(e_id, '+FLAGS', '\\Deleted')
-                        count += 1
-        if count > 0: mail.expunge()
-    except: pass
-
-def process_emails():
-    try:
-        mail = get_imap_connection(EMAIL_USER, EMAIL_PASS)
-        mail.select("inbox")
-
-        status, messages = mail.search(None, 'UNSEEN')
-        processed = False
-
-        if messages[0]:
             email_ids = messages[0].split()
-            print(f"[DEBUG] Processing {len(email_ids)} unread emails...")
+            logger.info(f"Found {len(email_ids)} unread emails. Analyzing...")
+            
+            deleted_ids = []
 
             for e_id in email_ids:
-                res, msg_data = mail.fetch(e_id, "(RFC822)")
-                for response_part in msg_data:
-                    if isinstance(response_part, tuple):
-                        msg = email.message_from_bytes(response_part[1])
+                res, data = client.fetch(e_id, "(RFC822)")
+                raw_email = data[0][1]
+                msg = email.message_from_bytes(raw_email)
+                
+                # Check Subject
+                subject = self.email_svc.decode_subject(msg.get("Subject")).upper()
+                if Config.TRIGGER_SUBJECT not in subject:
+                    continue
+                
+                logger.info(f"Target log detected: {subject}")
+
+                # Extract Body (HTML or Text)
+                body_content = ""
+                if msg.is_multipart():
+                    for part in msg.walk():
+                        if part.get_content_type() in ["text/plain", "text/html"]:
+                            payload = part.get_payload(decode=True)
+                            if payload: body_content += payload.decode(errors='ignore')
+                else:
+                    body_content = msg.get_payload(decode=True).decode(errors='ignore')
+
+                # Parse Data
+                log_data = self.parse_log_content(body_content)
+                
+                if log_data["user"]:
+                    logger.info(f"Extracted -> User: {log_data['user']} | IP: {log_data['ip']}")
+                    
+                    # 1. Send Email
+                    if self.email_svc.send_verification_request(log_data["user"], log_data["time"], log_data["ip"]):
+                        # 2. Mark for deletion
+                        client.store(e_id, '+FLAGS', '\\Deleted')
+                        deleted_ids.append(e_id)
                         
-                        raw_sub = msg.get("Subject")
-                        sub = get_decoded_header(raw_sub)
-                        
-                        # Filter by Subject
-                        if TARGET_SUBJECT not in sub.upper(): continue
+                        # 3. Start Timer Thread
+                        t = threading.Thread(
+                            target=self.verification_task, 
+                            args=(log_data["user"], log_data["ip"])
+                        )
+                        t.start()
+                else:
+                    logger.warning("Could not parse username from log body.")
 
-                        print(f"[MATCH] Log Found: {sub}")
+            # Cleanup
+            self.email_svc.cleanup_mailbox(client, deleted_ids)
+            
+            client.close()
+            client.logout()
 
-                        # Combine Text and HTML parts
-                        full_body = ""
-                        if msg.is_multipart():
-                            for part in msg.walk():
-                                if part.get_content_type() in ["text/plain", "text/html"]:
-                                    p = part.get_payload(decode=True)
-                                    if p: full_body += p.decode(errors='ignore')
-                        else:
-                            full_body = msg.get_payload(decode=True).decode(errors='ignore')
+        except Exception as e:
+            logger.error(f"Runtime loop error: {e}")
 
-                        # REGEX Extraction
-                        user_match = re.search(r'user=["\']?([^"\s\']+)["\']?', full_body, re.IGNORECASE)
-                        time_match = re.search(r'date=(\S+)\s+time=(\S+)', full_body)
-                        ip_match = re.search(r'remip=([\d\.]+)', full_body)
-                        
-                        if user_match:
-                            raw_user = user_match.group(1)
-                            user = raw_user.replace("&quot;", "").replace('"', "").replace("'", "").strip()
-                            
-                            ts = f"{time_match.group(1)} {time_match.group(2)}" if time_match else "Unknown Time"
-                            ip = ip_match.group(1) if ip_match else "0.0.0.0"
-                            
-                            print(f"[INFO] User: {user} | IP: {ip}")
-                            
-                            # 1. Send Warning Email
-                            sent = send_inquiry_email(user, ts, ip)
-                            
-                            if sent:
-                                # 2. Delete Log from Inbox
-                                mail.store(e_id, '+FLAGS', '\\Deleted')
-                                processed = True
-                                
-                                # 3. Start Verification Timer (Async)
-                                t = threading.Thread(target=verify_response_and_act, args=(user, ip))
-                                t.start()
+    def start(self):
+        logger.info("VPN Sentinel is online. Monitoring logs...")
+        logger.info(f"Target Subject: '{Config.TRIGGER_SUBJECT}'")
+        
+        while True:
+            self.scan_cycle()
+            time.sleep(Config.CHECK_INTERVAL)
 
-            if processed:
-                mail.expunge()
-                delete_logs_from_trash(mail)
-
-        mail.close()
-        mail.logout()
-
-    except Exception as e:
-        print(f"[ERROR] Main Loop Error: {e}")
-
+# --- ENTRY POINT ---
 if __name__ == "__main__":
-    print(f"VPN Guard Bot Started...")
-    print(f"Target Subject: {TARGET_SUBJECT}")
-    print(f"Active Response Wait Time: {WAIT_TIME_SECONDS}s")
-    while True:
-        process_emails()
-        time.sleep(POLL_INTERVAL)
+    bot = VPNSentinel()
+    bot.start()
